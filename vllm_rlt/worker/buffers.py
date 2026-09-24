@@ -85,6 +85,7 @@ class Workspace:
             self.gpu[name][:count].copy_(self.host[name][:count], non_blocking=True)
         return _PreparedKVBatch(
             owner=cache,
+            lockstep_planes=cache._lockstep_planes(rows),
             rows=rows,
             allocations=tuple(dict(zip(ids, (a for a, _, _ in rows))).items()),
             position_ids=self.gpu["positions"][:size],

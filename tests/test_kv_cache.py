@@ -340,3 +340,58 @@ def test_snapshot_refuses_leased_allocations():
     cache.pin_transfer("a", "t")
     with pytest.raises(RuntimeError, match="transfer"):
         cache.snapshot("a")
+
+
+def test_lockstep_decode_batches_are_detected_once_and_advance_every_layer():
+    cache = make_cache()
+    assert cache.allocate("a", 4)
+    assert cache.allocate("b", 4)
+    fill_prefix(cache, "a", [0], depths=[0])
+    fill_prefix(cache, "b", [0, 1], depths=[0])
+    # Both rows write their plane's next in-order position: lockstep.
+    batch = cache._prepare_batch(["a", "b"], [0, 0], [1, 2])
+    assert batch.lockstep_planes is not None and len(batch.lockstep_planes) == 2
+    k = torch.ones(2, 1, 4)
+    cache.write(0, ["a", "b"], [0, 0], [1, 2], k, k)
+    cache.write(1, ["a", "b"], [0, 0], [1, 2], k, k)
+    assert cache.token_written("a", 1, 0) and cache.token_written("b", 2, 0)
+    assert cache.read(0, "a", 0)[0].shape[0] == 2 and cache.read(1, "b", 0)[0].shape[0] == 3
+    # A batch that is not in order (a gap, a repeat, or a partially written
+    # layer) takes the general path.
+    assert cache._prepare_batch(["a"], [0], [3]).lockstep_planes is None
+    assert cache._prepare_batch(["a", "a"], [0, 0], [2, 3]).lockstep_planes is None
+    cache.write(0, ["a"], [0], [2], k[:1], k[:1])  # layer 0 ahead of layer 1
+    assert cache._prepare_batch(["a"], [0], [2]).lockstep_planes is None
+    # Read-only preparations never claim lockstep.
+    assert cache._prepare_batch(["b"], [0], [3], for_write=False).lockstep_planes is None
+
+
+def test_lockstep_attend_still_requires_the_layer_write():
+    cache = make_cache()
+    assert cache.allocate("a", 2)
+    batch = cache._prepare_batch(["a"], [0], [0])
+    assert batch.lockstep_planes is not None
+    with pytest.raises(RuntimeError, match="lockstep batch attended before its write"):
+        cache._attend_prepared(0, batch, torch.zeros(1, 1, 4))
+    cache._write_prepared(0, batch, torch.ones(1, 1, 4), torch.ones(1, 1, 4))
+    torch.testing.assert_close(
+        cache._attend_prepared(0, batch, torch.zeros(1, 1, 4)), torch.ones(1, 1, 4)
+    )
+
+
+def test_lockstep_and_general_paths_leave_identical_written_state():
+    def drive(cache):
+        assert cache.allocate("a", 6)
+        for position in range(3):
+            for layer in range(cache.num_layers):
+                k = torch.full((1, 1, 4), float(position))
+                cache.write(layer, ["a"], [0], [position], k, k)
+        return [
+            [(w.prefix, set(w.pending)) for w in plane] for plane in cache._allocations["a"].written
+        ]
+
+    fast = drive(make_cache())
+    slow_cache = make_cache()
+    slow_cache._lockstep_planes = lambda rows: None
+    slow = drive(slow_cache)
+    assert fast == slow
