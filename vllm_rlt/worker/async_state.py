@@ -197,6 +197,7 @@ class AsyncState:
                 raise ValueError("duplicate KV write addresses")
             batch = _PreparedKVBatch(
                 owner=self.cache,
+                lockstep_planes=self.cache._lockstep_planes(rows),
                 rows=rows,
                 allocations=tuple(dict(zip(ids, (a for a, _, _ in rows))).items()),
                 position_ids=bank.host[: len(rows), 2],

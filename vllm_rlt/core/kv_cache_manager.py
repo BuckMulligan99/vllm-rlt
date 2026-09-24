@@ -88,6 +88,11 @@ class _PreparedKVBatch:
     writable: bool
     cu_seqlens_q: torch.Tensor | None = None
     max_seqlen_q: int = 1
+    # Set when every row is plain in-order decode: it writes its plane's next
+    # position, and all layers of that plane are at the same prefix with no
+    # pending writes. Decided once per traversal, so the per-layer write and
+    # attend calls can skip the row-by-row checks and just bump a counter.
+    lockstep_planes: tuple[list, ...] | None = None
 
 
 class KVCacheManager:
@@ -612,6 +617,7 @@ class KVCacheManager:
         return _PreparedKVBatch(
             owner=self,
             rows=rows,
+            lockstep_planes=self._lockstep_planes(rows) if for_write else None,
             allocations=tuple(allocations.items()),
             position_ids=torch.tensor(
                 [position for _, _, position in rows], device=self.device, dtype=torch.long
@@ -638,6 +644,20 @@ class KVCacheManager:
             ),
             max_seqlen_q=max_query,
         )
+
+    def _lockstep_planes(self, rows) -> tuple[list, ...] | None:
+        """Return each row's written-state plane if this is in-order decode, else None."""
+        planes = []
+        for allocation, depth, position in rows:
+            plane = allocation.written[self._plane(depth)]
+            for written in plane:
+                if written.prefix != position or written.pending:
+                    return None
+            planes.append(plane)
+        # Two rows on the same plane would bump the same counter twice.
+        if len({id(p) for p in planes}) != len(planes):
+            return None
+        return tuple(planes)
 
     def _require_live_batch(self, batch: _PreparedKVBatch) -> None:
         if batch.owner is not self:
@@ -683,7 +703,9 @@ class KVCacheManager:
         self, layer: int, batch: _PreparedKVBatch, k: torch.Tensor, v: torch.Tensor
     ) -> None:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        # Allocations cannot change in the middle of a traversal, so check once.
+        if layer == 0 or batch.lockstep_planes is None:
+            self._require_live_batch(batch)
         if not batch.writable:
             raise ValueError("a read-only prepared KV batch cannot be written")
         self._validate_tensor(k, len(batch.position_ids), "k")
@@ -692,6 +714,10 @@ class KVCacheManager:
             return
         self.key_cache[batch.write_blocks, layer, batch.write_offsets] = k[: len(batch.rows)]
         self.value_cache[batch.write_blocks, layer, batch.write_offsets] = v[: len(batch.rows)]
+        if batch.lockstep_planes is not None:
+            for plane in batch.lockstep_planes:
+                plane[layer].prefix += 1
+            return
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
@@ -723,12 +749,20 @@ class KVCacheManager:
         self, layer: int, batch: _PreparedKVBatch, q: torch.Tensor
     ) -> torch.Tensor:
         self._validate_layer(layer)
-        self._require_live_batch(batch)
+        if layer == 0 or batch.lockstep_planes is None:
+            self._require_live_batch(batch)
         self._validate_tensor(q, len(batch.position_ids), "q", query=True)
         if not batch.rows:
             return torch.empty_like(q)
-        for allocation, depth, position in batch.rows:
-            self._require_prefix(allocation, layer, depth, position + 1)
+        if batch.lockstep_planes is not None:
+            # This layer just wrote each row's position, and everything before
+            # it was written in order, so the prefix is complete.
+            for plane, (_, _, position) in zip(batch.lockstep_planes, batch.rows):
+                if plane[layer].prefix <= position:
+                    raise RuntimeError("lockstep batch attended before its write")
+        else:
+            for allocation, depth, position in batch.rows:
+                self._require_prefix(allocation, layer, depth, position + 1)
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
